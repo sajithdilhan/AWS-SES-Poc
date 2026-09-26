@@ -45,12 +45,67 @@ These are the only settings, and neither is a secret. The app will not start if 
 
 ## AWS setup
 
-1. **SES identity**: In the SES console for your region, verify the sender (`FromAddress`) as an email identity or verify its domain.
-2. **SES sandbox**: A new account can only send *to verified addresses*. Verify each test recipient, or request production access.
-3. **IAM policy**: Create a policy from [`deploy/iam-policy-ses-send.json`](deploy/iam-policy-ses-send.json) after replacing `<REGION>`, `<ACCOUNT_ID>` and the `ses:FromAddress` condition value.
-4. **IAM role**: Create a role with the trust policy [`deploy/ec2-trust-policy.json`](deploy/ec2-trust-policy.json) (the console option "AWS service → EC2" does the same) and attach the policy from step 3.
-5. **Attach to the instance**: In the EC2 console, open the instance and choose **Actions → Security → Modify IAM role**, then pick the role.
-6. **Network**: The instance needs outbound HTTPS (443) to `email.<region>.amazonaws.com` through an internet/NAT gateway or an SES VPC endpoint. IMDS must be enabled. IMDSv2-required works at the default hop limit because IIS runs directly on the host.
+The steps below use the AWS CLI from your dev machine; every one has a console equivalent.
+Names used throughout: role `SesPocEc2Role`, policy `SesPocSesSend`, instance profile `SesPocEc2Profile`.
+
+### 1. Verify the SES identity
+
+Verify the sender (`FromAddress`) as an email identity, or verify its domain:
+
+```powershell
+aws sesv2 create-email-identity --email-identity no-reply@example.com --region us-east-1
+```
+
+AWS emails a confirmation link to that address; click it before sending. For a domain identity, publish the returned DKIM CNAME records instead.
+
+**SES sandbox**: a new account can only send *to verified addresses*, at a low daily rate. Verify each test recipient the same way, or open a production-access request from the SES console (**Account dashboard → Request production access**).
+
+### 2. Create the IAM policy
+
+Edit [`deploy/iam-policy-ses-send.json`](deploy/iam-policy-ses-send.json) and replace `<REGION>`, `<ACCOUNT_ID>` and the `ses:FromAddress` condition value with your own, then:
+
+```powershell
+aws iam create-policy --policy-name SesPocSesSend --policy-document file://deploy/iam-policy-ses-send.json
+```
+
+The condition pins the policy to one sender address, so a compromised instance cannot send as anyone else.
+
+### 3. Create the role and instance profile
+
+```powershell
+aws iam create-role --role-name SesPocEc2Role --assume-role-policy-document file://deploy/ec2-trust-policy.json
+aws iam attach-role-policy --role-name SesPocEc2Role --policy-arn arn:aws:iam::<ACCOUNT_ID>:policy/SesPocSesSend
+aws iam create-instance-profile --instance-profile-name SesPocEc2Profile
+aws iam add-role-to-instance-profile --instance-profile-name SesPocEc2Profile --role-name SesPocEc2Role
+```
+
+The console shortcut **Create role → AWS service → EC2** applies the same trust policy and creates the matching instance profile for you; via the CLI both are separate calls.
+
+### 4. Launch (or pick) the Windows EC2 instance
+
+A Windows Server 2022 Base AMI on `t3.small` or larger is enough for IIS plus this API. It needs:
+
+- a **Security Group** allowing inbound RDP (3389) from your IP and HTTP (80) from wherever you will test;
+- a subnet with outbound internet — an internet gateway plus public IP, or a NAT gateway;
+- **IMDS enabled**. IMDSv2-required is fine at the default hop limit of 1, because IIS runs directly on the host rather than in a container.
+
+### 5. Attach the instance profile
+
+```powershell
+aws ec2 associate-iam-instance-profile --instance-id i-0123456789abcdef0 --iam-instance-profile Name=SesPocEc2Profile
+```
+
+In the console this is **Actions → Security → Modify IAM role** on the instance. The change takes effect within a minute or so; no reboot is needed, but recycle the IIS app pool so the SDK picks up fresh credentials.
+
+### 6. Confirm network reachability
+
+From the instance, SES must be reachable on HTTPS (443):
+
+```powershell
+Test-NetConnection email.us-east-1.amazonaws.com -Port 443
+```
+
+If the instance has no route to the internet, add an **SES VPC endpoint** (`com.amazonaws.<region>.email-smtp` for SMTP, or use a NAT gateway for the API endpoint) instead of opening outbound internet access.
 
 ## Build and publish (dev machine)
 
@@ -83,6 +138,46 @@ This is a framework-dependent publish. The generated `web.config` uses the ASP.N
 2. Browse to `http://<ec2-host>/swagger` and `POST /api/users/register` with a verified recipient (in sandbox mode). Expect `201` and the email in the inbox.
 3. `GET /api/users` should list the user.
 4. Negative test (optional): detach the role or remove the policy, recycle the app pool, and register again. Expect `502` with nothing saved.
+
+## Cleaning up AWS resources
+
+Tear down in this order — IAM refuses to delete a role or policy that is still attached to something.
+
+1. **Detach the instance profile from the instance** (find the association id first):
+   ```powershell
+   aws ec2 describe-iam-instance-profile-associations --filters Name=instance-id,Values=i-0123456789abcdef0
+   aws ec2 disassociate-iam-instance-profile --association-id iip-assoc-0123456789abcdef0
+   ```
+2. **Terminate the instance** (or keep it if you only wanted to remove SES access):
+   ```powershell
+   aws ec2 terminate-instances --instance-ids i-0123456789abcdef0
+   ```
+   The root EBS volume goes with it only if **Delete on termination** was left at its default `true`; check **Storage** on the instance beforehand and delete any leftover volume. Release any Elastic IP you allocated (`aws ec2 release-address`), or it keeps billing while unattached.
+3. **Delete the instance profile and role**:
+   ```powershell
+   aws iam remove-role-from-instance-profile --instance-profile-name SesPocEc2Profile --role-name SesPocEc2Role
+   aws iam delete-instance-profile --instance-profile-name SesPocEc2Profile
+   aws iam detach-role-policy --role-name SesPocEc2Role --policy-arn arn:aws:iam::<ACCOUNT_ID>:policy/SesPocSesSend
+   aws iam delete-role --role-name SesPocEc2Role
+   ```
+4. **Delete the policy**:
+   ```powershell
+   aws iam delete-policy --policy-arn arn:aws:iam::<ACCOUNT_ID>:policy/SesPocSesSend
+   ```
+   If this fails with `DeleteConflict`, something is still attached — list it with `aws iam list-entities-for-policy --policy-arn ...`.
+5. **Delete the SES identities** you verified for the POC:
+   ```powershell
+   aws sesv2 list-email-identities --region us-east-1
+   aws sesv2 delete-email-identity --email-identity no-reply@example.com --region us-east-1
+   ```
+   Do this per region — SES identities are regional, and verifying in the wrong region is a common cause of `MessageRejected`. If you verified a domain, also remove the DKIM CNAME records from DNS.
+6. **Delete the Security Group** once the instance is fully terminated (a group in use cannot be deleted):
+   ```powershell
+   aws ec2 delete-security-group --group-id sg-0123456789abcdef0
+   ```
+7. **Check for stragglers**: CloudWatch log groups, snapshots, and a key pair (`aws ec2 delete-key-pair`) if you created one only for this POC.
+
+Nothing here leaves state on your dev machine — the app stores no credentials, and the in-memory DB disappears with the process. If SES production access was granted, it stays on the account; that is an account-level setting, not a resource, and there is no cost to leaving it.
 
 ## Troubleshooting
 
